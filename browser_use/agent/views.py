@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import traceback
 from dataclasses import dataclass
@@ -72,6 +73,7 @@ class AgentSettings(BaseModel):
 class AgentState(BaseModel):
 	"""Holds all state information for an Agent"""
 
+	model_config = ConfigDict(arbitrary_types_allowed=True)
 	agent_id: str = Field(default_factory=uuid7str)
 	n_steps: int = 1
 	consecutive_failures: int = 0
@@ -81,12 +83,10 @@ class AgentState(BaseModel):
 	last_model_output: AgentOutput | None = None
 	paused: bool = False
 	stopped: bool = False
+	current_llm_task: asyncio.Task | None = None
 
 	message_manager_state: MessageManagerState = Field(default_factory=MessageManagerState)
 	file_system_state: FileSystemState | None = None
-
-	# class Config:
-	# 	arbitrary_types_allowed = True
 
 
 @dataclass

@@ -793,27 +793,33 @@ class BrowserSession(BaseModel):
 			retry_count: Number of retries already attempted (max 2)
 		"""
 		# Try connecting via passed objects first
-		await self.setup_browser_via_passed_objects()
-		if self.browser_context:
-			return
+		# await self.setup_browser_via_passed_objects()
+		# if self.browser_context:
+		# 	return
 
 		# Try connecting via browser PID
-		await self.setup_browser_via_browser_pid()
-		if self.browser_context:
-			return
+		# await self.setup_browser_via_browser_pid()
+		# if self.browser_context:
+		# 	return
 
 		# Try connecting via WSS URL
-		await self.setup_browser_via_wss_url()
-		if self.browser_context:
-			return
+		# await self.setup_browser_via_wss_url()
+		# if self.browser_context:
+		# 	return
 
 		# Try connecting via CDP URL
+		if not self.cdp_url:
+			raise ValueError("BrowserSession must be initialized with a cdp_url to connect to an existing browser.")
+
 		await self.setup_browser_via_cdp_url()
 		if self.browser_context:
 			return
 
 		# Launch new browser as last resort
-		await self.setup_new_browser_context(retry_count)
+		# await self.setup_new_browser_context(retry_count)
+
+		if not self.browser_context:
+			raise ConnectionError(f"Failed to connect to browser via CDP URL: {self.cdp_url}")
 
 	# Removed _take_screenshot_hybrid - merged into take_screenshot
 

@@ -474,6 +474,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 
 		self._external_pause_event = asyncio.Event()
 		self._external_pause_event.set()
+		self._stop_event = asyncio.Event()
 
 	@property
 	def logger(self) -> logging.Logger:
@@ -482,6 +483,9 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		_browser_session_id = self.browser_session.id if self.browser_session else self.id
 		_current_page_id = str(id(self.browser_session and self.browser_session.agent_current_page))[-2:]
 		return logging.getLogger(f'browser_use.Agent🅰 {self.task_id[-4:]} on 🆂 {_browser_session_id[-4:]} 🅟 {_current_page_id}')
+
+
+
 
 	@property
 	def browser(self) -> Browser:
@@ -661,6 +665,9 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			if await self.register_external_agent_status_raise_error_callback():
 				raise InterruptedError
 
+		if self._stop_event.is_set():
+			raise InterruptedError("Agent stopped by external request.")
+
 		if self.state.stopped or self.state.paused:
 			# self.logger.debug('Agent paused after getting state')
 			raise InterruptedError
@@ -686,6 +693,8 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			await self._post_process()
 
 		except Exception as e:
+			if isinstance(e, InterruptedError):
+				raise
 			# Handle ALL exceptions in one place
 			await self._handle_step_error(e)
 
@@ -741,21 +750,27 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 	@observe_debug(ignore_input=True, name='get_next_action')
 	async def _get_next_action(self, browser_state_summary: BrowserStateSummary) -> None:
 		"""Execute LLM interaction with retry logic and handle callbacks"""
+		start_time = time.time()
 		input_messages = self._message_manager.get_messages()
+		self.logger.info(f"PERF: get_messages took {time.time() - start_time:.2f}s")
+
 		self.logger.debug(
 			f'🤖 Step {self.state.n_steps + 1}: Calling LLM with {len(input_messages)} messages (model: {self.llm.model})...'
 		)
 
 		try:
+			start_time = time.time()
 			model_output = await asyncio.wait_for(
 				self._get_model_output_with_retry(input_messages), timeout=self.settings.llm_timeout
 			)
+			self.logger.info(f"PERF: LLM call took {time.time() - start_time:.2f}s")
 		except TimeoutError:
 			raise TimeoutError(
 				f'LLM call timed out after {self.settings.llm_timeout} seconds. Keep your thinking and output short.'
 			)
 
 		self.state.last_model_output = model_output
+
 
 		# Check again for paused/stopped state after getting model output
 		await self._raise_if_stopped_or_paused()
@@ -893,7 +908,18 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 
 	async def _get_model_output_with_retry(self, input_messages: list[BaseMessage]) -> AgentOutput:
 		"""Get model output with retry logic for empty actions"""
-		model_output = await self.get_model_output(input_messages)
+		try:
+			# Create a task for the LLM call and store it in the state
+			self.state.current_llm_task = asyncio.create_task(self.get_model_output(input_messages))
+			model_output = await self.state.current_llm_task
+		except asyncio.CancelledError:
+			# If the task is cancelled, we re-raise the error to be handled by the stop logic
+			self.logger.info("LLM task was cancelled.")
+			raise InterruptedError("LLM call cancelled by user.")
+		finally:
+			# Clean up the task reference once it's done or cancelled
+			self.state.current_llm_task = None
+
 		self.logger.debug(
 			f'✅ Step {self.state.n_steps + 1}: Got LLM response with {len(model_output.action) if model_output.action else 0} actions'
 		)
@@ -910,6 +936,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			)
 
 			retry_messages = input_messages + [clarification_message]
+			# We don't need to wrap this retry call in a task, as it's a fallback.
 			model_output = await self.get_model_output(retry_messages)
 
 			if not model_output.action or all(action.model_dump() == {} for action in model_output.action):
@@ -1219,84 +1246,88 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 				self.logger.debug('✅ Initial actions completed')
 
 			self.logger.debug(f'🔄 Starting main execution loop with max {max_steps} steps...')
-			for step in range(max_steps):
-				# Replace the polling with clean pause-wait
-				if self.state.paused:
-					self.logger.debug(f'⏸️ Step {step}: Agent paused, waiting to resume...')
-					await self.wait_until_resumed()
-					signal_handler.reset()
+			try:
+				for step in range(max_steps):
+					# Replace the polling with clean pause-wait
+					if self.state.paused:
+						self.logger.debug(f'⏸️ Step {step}: Agent paused, waiting to resume...')
+						await self.wait_until_resumed()
+						signal_handler.reset()
 
-				# Check if we should stop due to too many failures
-				if self.state.consecutive_failures >= self.settings.max_failures:
-					self.logger.error(f'❌ Stopping due to {self.settings.max_failures} consecutive failures')
-					agent_run_error = f'Stopped due to {self.settings.max_failures} consecutive failures'
-					break
-
-				# Check control flags before each step
-				if self.state.stopped:
-					self.logger.info('🛑 Agent stopped')
-					agent_run_error = 'Agent stopped programmatically'
-					break
-
-				while self.state.paused:
-					await asyncio.sleep(0.2)  # Small delay to prevent CPU spinning
-					if self.state.stopped:  # Allow stopping while paused
-						agent_run_error = 'Agent stopped programmatically while paused'
+					# Check if we should stop due to too many failures
+					if self.state.consecutive_failures >= self.settings.max_failures:
+						self.logger.error(f'❌ Stopping due to {self.settings.max_failures} consecutive failures')
+						agent_run_error = f'Stopped due to {self.settings.max_failures} consecutive failures'
 						break
 
-				if on_step_start is not None:
-					await on_step_start(self)
+					# Check control flags before each step
+					if self.state.stopped:
+						self.logger.info('🛑 Agent stopped')
+						agent_run_error = 'Agent stopped programmatically'
+						break
 
-				self.logger.debug(f'🚶 Starting step {step + 1}/{max_steps}...')
-				step_info = AgentStepInfo(step_number=step, max_steps=max_steps)
+					while self.state.paused:
+						await asyncio.sleep(0.2)  # Small delay to prevent CPU spinning
+						if self.state.stopped:  # Allow stopping while paused
+							agent_run_error = 'Agent stopped programmatically while paused'
+							break
 
-				try:
-					await asyncio.wait_for(
-						self.step(step_info),
-						timeout=self.settings.step_timeout,
+					if on_step_start is not None:
+						await on_step_start(self)
+
+					self.logger.debug(f'🚶 Starting step {step + 1}/{max_steps}...')
+					step_info = AgentStepInfo(step_number=step, max_steps=max_steps)
+
+					try:
+						await asyncio.wait_for(
+							self.step(step_info),
+							timeout=self.settings.step_timeout,
+						)
+						self.logger.debug(f'✅ Completed step {step + 1}/{max_steps}')
+					except TimeoutError:
+						# Handle step timeout gracefully
+						error_msg = f'Step {step + 1} timed out after {self.settings.step_timeout} seconds'
+						self.logger.error(f'⏰ {error_msg}')
+						self.state.consecutive_failures += 1
+						self.state.last_result = [ActionResult(error=error_msg)]
+
+					if on_step_end is not None:
+						await on_step_end(self)
+
+					if self.state.history.is_done():
+						self.logger.debug(f'🎯 Task completed after {step + 1} steps!')
+						await self.log_completion()
+
+						if self.register_done_callback:
+							if inspect.iscoroutinefunction(self.register_done_callback):
+								await self.register_done_callback(self.state.history)
+							else:
+								self.register_done_callback(self.state.history)
+
+						# Task completed
+						break
+				else:
+					agent_run_error = 'Failed to complete task in maximum steps'
+
+					self.state.history.history.append(
+						AgentHistory(
+							model_output=None,
+							result=[ActionResult(error=agent_run_error, include_in_memory=True)],
+							state=BrowserStateHistory(
+								url='',
+								title='',
+								tabs=[],
+								interacted_element=[],
+								screenshot=None,
+							),
+							metadata=None,
+						)
 					)
-					self.logger.debug(f'✅ Completed step {step + 1}/{max_steps}')
-				except TimeoutError:
-					# Handle step timeout gracefully
-					error_msg = f'Step {step + 1} timed out after {self.settings.step_timeout} seconds'
-					self.logger.error(f'⏰ {error_msg}')
-					self.state.consecutive_failures += 1
-					self.state.last_result = [ActionResult(error=error_msg)]
 
-				if on_step_end is not None:
-					await on_step_end(self)
-
-				if self.state.history.is_done():
-					self.logger.debug(f'🎯 Task completed after {step + 1} steps!')
-					await self.log_completion()
-
-					if self.register_done_callback:
-						if inspect.iscoroutinefunction(self.register_done_callback):
-							await self.register_done_callback(self.state.history)
-						else:
-							self.register_done_callback(self.state.history)
-
-					# Task completed
-					break
-			else:
-				agent_run_error = 'Failed to complete task in maximum steps'
-
-				self.state.history.history.append(
-					AgentHistory(
-						model_output=None,
-						result=[ActionResult(error=agent_run_error, include_in_memory=True)],
-						state=BrowserStateHistory(
-							url='',
-							title='',
-							tabs=[],
-							interacted_element=[],
-							screenshot=None,
-						),
-						metadata=None,
-					)
-				)
-
-				self.logger.info(f'❌ {agent_run_error}')
+					self.logger.info(f'❌ {agent_run_error}')
+			except InterruptedError:
+				agent_run_error = 'Agent stopped by user request.'
+				self.logger.info(f'🛑 {agent_run_error}')
 
 			self.logger.debug('📊 Collecting usage summary...')
 			self.state.history.usage = await self.token_cost_service.get_usage_summary()
@@ -1400,55 +1431,55 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 
 		# loop over actions and execute them
 		for i, action in enumerate(actions):
-			if i > 0:
-				# ONLY ALLOW TO CALL `done` IF IT IS A SINGLE ACTION
-				if action.model_dump(exclude_unset=True).get('done') is not None:
-					msg = f'Done action is allowed only as a single action - stopped after action {i} / {len(actions)}.'
-					logger.info(msg)
-					break
-
-				if action.get_index() is not None:
-					new_browser_state_summary = await self.browser_session.get_browser_state_with_recovery(
-						cache_clickable_elements_hashes=False, include_screenshot=False
-					)
-					new_selector_map = new_browser_state_summary.selector_map
-
-					# Detect index change after previous action
-					orig_target = cached_selector_map.get(action.get_index())  # type: ignore
-					orig_target_hash = orig_target.hash.branch_path_hash if orig_target else None
-					new_target = new_selector_map.get(action.get_index())  # type: ignore
-					new_target_hash = new_target.hash.branch_path_hash if new_target else None
-					if orig_target_hash != new_target_hash:
-						msg = f'Element index changed after action {i} / {len(actions)}, because page changed.'
-						logger.info(msg)
-						results.append(
-							ActionResult(
-								extracted_content=msg,
-								include_in_memory=True,
-								long_term_memory=msg,
-							)
-						)
-						break
-
-					new_path_hashes = {e.hash.branch_path_hash for e in new_selector_map.values()}
-					if check_for_new_elements and not new_path_hashes.issubset(cached_path_hashes):
-						# next action requires index but there are new elements on the page
-						msg = f'Something new appeared after action {i} / {len(actions)}, following actions are NOT executed and should be retried.'
-						logger.info(msg)
-						results.append(
-							ActionResult(
-								extracted_content=msg,
-								include_in_memory=True,
-								long_term_memory=msg,
-							)
-						)
-						break
-
-				# wait between actions
-				await asyncio.sleep(self.browser_profile.wait_between_actions)
-
 			try:
 				await self._raise_if_stopped_or_paused()
+
+				if i > 0:
+					# ONLY ALLOW TO CALL `done` IF IT IS A SINGLE ACTION
+					if action.model_dump(exclude_unset=True).get('done') is not None:
+						msg = f'Done action is allowed only as a single action - stopped after action {i} / {len(actions)}.'
+						logger.info(msg)
+						break
+
+					if action.get_index() is not None:
+						new_browser_state_summary = await self.browser_session.get_browser_state_with_recovery(
+							cache_clickable_elements_hashes=False, include_screenshot=False
+						)
+						new_selector_map = new_browser_state_summary.selector_map
+
+						# Detect index change after previous action
+						orig_target = cached_selector_map.get(action.get_index())  # type: ignore
+						orig_target_hash = orig_target.hash.branch_path_hash if orig_target else None
+						new_target = new_selector_map.get(action.get_index())  # type: ignore
+						new_target_hash = new_target.hash.branch_path_hash if new_target else None
+						if orig_target_hash != new_target_hash:
+							msg = f'Element index changed after action {i} / {len(actions)}, because page changed.'
+							logger.info(msg)
+							results.append(
+								ActionResult(
+									extracted_content=msg,
+									include_in_memory=True,
+									long_term_memory=msg,
+								)
+							)
+							break
+
+						new_path_hashes = {e.hash.branch_path_hash for e in new_selector_map.values()}
+						if check_for_new_elements and not new_path_hashes.issubset(cached_path_hashes):
+							# next action requires index but there are new elements on the page
+							msg = f'Something new appeared after action {i} / {len(actions)}, following actions are NOT executed and should be retried.'
+							logger.info(msg)
+							results.append(
+								ActionResult(
+									extracted_content=msg,
+									include_in_memory=True,
+									long_term_memory=msg,
+								)
+							)
+							break
+
+					# wait between actions
+					await asyncio.sleep(self.browser_profile.wait_between_actions)
 
 				result = await self.controller.act(
 					action=action,
@@ -1653,11 +1684,18 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			loop.create_task(asyncio.sleep(5))
 
 	def stop(self) -> None:
-		"""Stop the agent"""
-		self.logger.info('⏹️ Agent stopping')
-		self.state.stopped = True
+		"""Stop the agent gracefully."""
+		self.logger.info("Received stop signal. Agent will terminate after the current step.")
+		self._stop_event.set()
 
-		# Task stopped
+		# Cancel the current LLM task if it's running
+		if self.state.current_llm_task and not self.state.current_llm_task.done():
+			self.state.current_llm_task.cancel()
+			self.logger.info("Cancelled running LLM task.")
+
+		# Ensure paused agents can also be stopped
+		if self.state.paused:
+			self.resume()
 
 	def _convert_initial_actions(self, actions: list[dict[str, dict[str, Any]]]) -> list[ActionModel]:
 		"""Convert dictionary-based actions to ActionModel instances"""
